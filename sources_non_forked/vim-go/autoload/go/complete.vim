@@ -19,42 +19,29 @@ fu! s:gocodeCurrentBuffer()
     return file
 endf
 
-
-if go#vimproc#has_vimproc()
-    let s:vim_system = get(g:, 'gocomplete#system_function', 'vimproc#system2')
-else
-    let s:vim_system = get(g:, 'gocomplete#system_function', 'system')
-endif
-
-fu! s:system(str, ...)
-    return call(s:vim_system, [a:str] + a:000)
-endf
-
-fu! s:gocodeShellescape(arg)
-    try
-        let ssl_save = &shellslash
-        set noshellslash
-        return shellescape(a:arg)
-    finally
-        let &shellslash = ssl_save
-    endtry
-endf
-
 fu! s:gocodeCommand(cmd, preargs, args)
     for i in range(0, len(a:args) - 1)
-        let a:args[i] = s:gocodeShellescape(a:args[i])
+        let a:args[i] = go#util#Shellescape(a:args[i])
     endfor
     for i in range(0, len(a:preargs) - 1)
-        let a:preargs[i] = s:gocodeShellescape(a:preargs[i])
+        let a:preargs[i] = go#util#Shellescape(a:preargs[i])
     endfor
 
-    let bin_path = go#tool#BinPath(g:go_gocode_bin)
+    let bin_path = go#path#CheckBinPath(g:go_gocode_bin)
     if empty(bin_path)
         return
     endif
 
-    let result = s:system(printf('%s %s %s %s', bin_path, join(a:preargs), a:cmd, join(a:args)))
-    if v:shell_error != 0
+    " we might hit cache problems, as gocode doesn't handle well different
+    " GOPATHS: https://github.com/nsf/gocode/issues/239
+    let old_gopath = $GOPATH
+    let $GOPATH = go#path#Detect()
+
+    let result = go#util#System(printf('%s %s %s %s', go#util#Shellescape(bin_path), join(a:preargs), go#util#Shellescape(a:cmd), join(a:args)))
+
+    let $GOPATH = old_gopath
+
+    if go#util#ShellError() != 0
         return "[\"0\", []]"
     else
         if &encoding != 'utf-8'
@@ -68,31 +55,21 @@ fu! s:gocodeCurrentBufferOpt(filename)
     return '-in=' . a:filename
 endf
 
-fu! s:gocodeCursor()
-    if &encoding != 'utf-8'
-        let sep = &l:fileformat == 'dos' ? "\r\n" : "\n"
-        let c = col('.')
-        let buf = line('.') == 1 ? "" : (join(getline(1, line('.')-1), sep) . sep)
-        let buf .= c == 1 ? "" : getline('.')[:c-2]
-        return printf('%d', len(iconv(buf, &encoding, "utf-8")))
-    endif
-    return printf('%d', line2byte(line('.')) + (col('.')-2))
-endf
-
 fu! s:gocodeAutocomplete()
     let filename = s:gocodeCurrentBuffer()
     let result = s:gocodeCommand('autocomplete',
                 \ [s:gocodeCurrentBufferOpt(filename), '-f=vim'],
-                \ [expand('%:p'), s:gocodeCursor()])
+                \ [expand('%:p'), go#util#OffsetCursor()])
     call delete(filename)
     return result
 endf
 
 function! go#complete#GetInfo()
+    let offset = go#util#OffsetCursor()+1
     let filename = s:gocodeCurrentBuffer()
     let result = s:gocodeCommand('autocomplete',
                 \ [s:gocodeCurrentBufferOpt(filename), '-f=godit'],
-                \ [expand('%:p'), s:gocodeCursor()])
+                \ [expand('%:p'), offset])
     call delete(filename)
 
     " first line is: Charcount,,NumberOfCandidates, i.e: 8,,1
@@ -128,11 +105,19 @@ function! go#complete#GetInfo()
     return ""
 endfunction
 
-function! go#complete#Info()
+function! go#complete#Info(auto)
+    " auto is true if we were called by g:go_auto_type_info's autocmd
     let result = go#complete#GetInfo()
     if !empty(result)
+        " if auto, and the result is a PANIC by gocode, hide it
+        if a:auto && result ==# 'PANIC PANIC PANIC' | return | endif
         echo "vim-go: " | echohl Function | echon result | echohl None
     endif
+endfunction
+
+function! s:trim_bracket(val)
+    let a:val.word = substitute(a:val.word, '[(){}\[\]]\+$', '', '')
+    return a:val
 endfunction
 
 fu! go#complete#Complete(findstart, base)
@@ -142,6 +127,10 @@ fu! go#complete#Complete(findstart, base)
         return col('.') - g:gocomplete_completions[0] - 1
         "findstart = 0 when we need to return the list of completions
     else
+        let s = getline(".")[col('.') - 1]
+        if s =~ '[(){}\{\}]'
+            return map(copy(g:gocomplete_completions[1]), 's:trim_bracket(v:val)')
+        endif
         return g:gocomplete_completions[1]
     endif
 endf
